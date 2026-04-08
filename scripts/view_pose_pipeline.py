@@ -99,6 +99,24 @@ def parse_args():
         help="Discard per-camera poses with score lower than this threshold.",
     )
     parser.add_argument(
+        "--reject-large-jump",
+        action="store_true",
+        default=True,
+        help="Reject very large frame-to-frame pose jumps and keep the previous pose.",
+    )
+    parser.add_argument(
+        "--reject-translation-jump-m",
+        type=float,
+        default=0.20,
+        help="If fused translation jumps more than this, keep the previous frame pose.",
+    )
+    parser.add_argument(
+        "--reject-rotation-jump-deg",
+        type=float,
+        default=45.0,
+        help="If fused rotation jumps more than this, keep the previous frame pose.",
+    )
+    parser.add_argument(
         "--interactive-3d",
         action="store_true",
         help="Open an interactive Open3D window for the fused point cloud.",
@@ -689,6 +707,12 @@ def weighted_average_quaternions(quaternions: np.ndarray, weights: np.ndarray) -
     return quat
 
 
+def rotation_angle_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
+    relative = rotation_a.T @ rotation_b
+    cos_theta = np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
 def fuse_world_poses(
     poses_world: Dict[str, Tuple[np.ndarray, float]],
     inlier_thresh_m: float,
@@ -752,6 +776,180 @@ def load_depth_points_world(
     R_world_depth, t_world_depth = split_transform(T_world_depth)
     points_world = (R_world_depth @ points_depth.T).T + t_world_depth[None, :]
     return points_world.astype(np.float32)
+
+
+def world_from_depth_extrinsic(extrinsics_entry: Dict) -> np.ndarray:
+    return world_from_rgb_extrinsic(extrinsics_entry) @ rgb_from_depth_extrinsic(
+        extrinsics_entry
+    )
+
+
+def project_points_to_depth_image(
+    points_world: np.ndarray,
+    camera_params: Dict[str, Dict],
+    extrinsics: Dict[str, Dict],
+    cam_id: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    t_world_depth = world_from_depth_extrinsic(extrinsics[cam_id])
+    depth_from_world = invert_transform(t_world_depth)
+    r_depth_world, t_depth_world = split_transform(depth_from_world)
+    points_depth = (r_depth_world @ points_world.T).T + t_depth_world[None, :]
+    intr = camera_params[cam_id]["rgb_to_depth"]["depth_intrinsic"]
+    z = points_depth[:, 2]
+    valid = z > 1e-4
+    uv = np.full((len(points_depth), 2), -1.0, dtype=np.float64)
+    uv[valid, 0] = points_depth[valid, 0] * intr["fx"] / z[valid] + intr["cx"]
+    uv[valid, 1] = points_depth[valid, 1] * intr["fy"] / z[valid] + intr["cy"]
+    return uv, points_depth
+
+
+def evaluate_candidate_pose_multiview(
+    pose_world: np.ndarray,
+    frame_id: int,
+    camera_ids: List[str],
+    raw_data_dir: Path,
+    camera_params: Dict[str, Dict],
+    extrinsics: Dict[str, Dict],
+    mesh_points_m: np.ndarray,
+    max_depth_m: float,
+) -> Dict[str, object]:
+    r_world_obj, t_world_obj = split_transform(pose_world)
+    object_points_world = (r_world_obj @ mesh_points_m.T).T + t_world_obj[None, :]
+
+    total_valid = 0
+    total_inliers = 0
+    residual_sum = 0.0
+    per_view = {}
+    for cam_id in camera_ids:
+        depth_path = raw_data_dir / cam_id / "Depth" / f"{frame_id:05d}.png"
+        depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            per_view[cam_id] = {"valid": 0, "inliers": 0, "mae_mm": float("inf")}
+            continue
+        depth_m = depth.astype(np.float32) / 1000.0
+        h, w = depth.shape[:2]
+        uv, points_depth = project_points_to_depth_image(
+            object_points_world, camera_params, extrinsics, cam_id
+        )
+        x = np.rint(uv[:, 0]).astype(np.int32)
+        y = np.rint(uv[:, 1]).astype(np.int32)
+        z_pred = points_depth[:, 2]
+        inside = (
+            (x >= 0)
+            & (x < w)
+            & (y >= 0)
+            & (y < h)
+            & (z_pred > 0.05)
+            & (z_pred < max_depth_m)
+        )
+        if not np.any(inside):
+            per_view[cam_id] = {"valid": 0, "inliers": 0, "mae_mm": float("inf")}
+            continue
+
+        obs = depth_m[y[inside], x[inside]]
+        valid_obs = obs > 0.05
+        if not np.any(valid_obs):
+            per_view[cam_id] = {"valid": 0, "inliers": 0, "mae_mm": float("inf")}
+            continue
+
+        pred = z_pred[inside][valid_obs]
+        obs = obs[valid_obs]
+        residual_m = np.abs(obs - pred)
+        inliers = residual_m < 0.03
+        valid_count = int(len(residual_m))
+        inlier_count = int(np.count_nonzero(inliers))
+        mae_mm = float(np.mean(residual_m) * 1000.0)
+        total_valid += valid_count
+        total_inliers += inlier_count
+        residual_sum += float(np.sum(residual_m))
+        per_view[cam_id] = {
+            "valid": valid_count,
+            "inliers": inlier_count,
+            "mae_mm": mae_mm,
+        }
+
+    coverage = float(total_valid) / float(max(1, len(camera_ids) * len(mesh_points_m)))
+    inlier_ratio = float(total_inliers) / float(max(1, total_valid))
+    mean_residual_m = residual_sum / float(max(1, total_valid))
+    # Lower is better. Coverage and inlier ratio reduce the cost.
+    total_cost = mean_residual_m + 0.04 * (1.0 - inlier_ratio) + 0.02 * (1.0 - coverage)
+    return {
+        "cost": float(total_cost),
+        "coverage": coverage,
+        "inlier_ratio": inlier_ratio,
+        "per_view": per_view,
+    }
+
+
+def select_and_refine_multiview_pose(
+    candidate_poses_world: Dict[str, Tuple[np.ndarray, float]],
+    frame_id: int,
+    camera_ids: List[str],
+    raw_data_dir: Path,
+    camera_params: Dict[str, Dict],
+    extrinsics: Dict[str, Dict],
+    mesh_points_m: np.ndarray,
+    max_depth_m: float,
+) -> Tuple[Optional[np.ndarray], List[str], Dict[str, Dict[str, object]]]:
+    if not candidate_poses_world:
+        return None, [], {}
+
+    evaluations: Dict[str, Dict[str, object]] = {}
+    for cam_id, (pose_world, score) in candidate_poses_world.items():
+        eval_info = evaluate_candidate_pose_multiview(
+            pose_world=pose_world,
+            frame_id=frame_id,
+            camera_ids=camera_ids,
+            raw_data_dir=raw_data_dir,
+            camera_params=camera_params,
+            extrinsics=extrinsics,
+            mesh_points_m=mesh_points_m,
+            max_depth_m=max_depth_m,
+        )
+        eval_info["score"] = float(score)
+        evaluations[cam_id] = eval_info
+
+    ranked = sorted(
+        evaluations.items(),
+        key=lambda item: (item[1]["cost"], -item[1]["inlier_ratio"], -item[1]["score"]),
+    )
+    best_cam_id = ranked[0][0]
+    best_pose_world = candidate_poses_world[best_cam_id][0]
+    best_cost = float(ranked[0][1]["cost"])
+
+    selected_cam_ids = []
+    selected_transforms = []
+    selected_weights = []
+    for cam_id, eval_info in ranked:
+        if float(eval_info["cost"]) <= best_cost + 0.015:
+            selected_cam_ids.append(cam_id)
+            selected_transforms.append(candidate_poses_world[cam_id][0])
+            selected_weights.append(
+                max(1e-6, candidate_poses_world[cam_id][1])
+                * max(0.05, float(eval_info["inlier_ratio"]))
+                / max(float(eval_info["cost"]), 1e-6)
+            )
+
+    if not selected_transforms:
+        selected_cam_ids = [best_cam_id]
+        selected_transforms = [best_pose_world]
+        selected_weights = [1.0]
+
+    selected_weights_np = np.asarray(selected_weights, dtype=np.float64)
+    fused_t = np.average(
+        np.asarray([tf[:3, 3] for tf in selected_transforms], dtype=np.float64),
+        axis=0,
+        weights=selected_weights_np,
+    )
+    fused_q = weighted_average_quaternions(
+        Rotation.from_matrix(
+            np.asarray([tf[:3, :3] for tf in selected_transforms], dtype=np.float64)
+        ).as_quat(),
+        selected_weights_np,
+    )
+    fused_r = Rotation.from_quat(fused_q).as_matrix()
+    refined_pose = transform_matrix(fused_r, fused_t)
+    return refined_pose, selected_cam_ids, evaluations
 
 
 def render_fused_scene(
@@ -841,6 +1039,9 @@ def build_info_panel(
     inlier_cam_ids: List[str],
     per_cam_scores: Dict[str, float],
     min_pose_score: float,
+    selected_cam_ids: Optional[List[str]] = None,
+    candidate_costs: Optional[Dict[str, float]] = None,
+    fallback_cam_id: Optional[str] = None,
 ) -> np.ndarray:
     panel = np.full(shape, 248, dtype=np.uint8)
     lines = [
@@ -848,9 +1049,18 @@ def build_info_panel(
         f"fused views: {', '.join(inlier_cam_ids) if inlier_cam_ids else 'none'}",
         f"min score: {min_pose_score:.2f}",
     ]
+    if selected_cam_ids:
+        lines.append(f"selected: {', '.join(selected_cam_ids)}")
+    if fallback_cam_id:
+        lines.append(f"fallback: {fallback_cam_id}")
     for cam_id in sorted(per_cam_scores):
         state = "use" if per_cam_scores[cam_id] >= min_pose_score else "skip"
-        lines.append(f"{cam_id}: {per_cam_scores[cam_id]:.3f} [{state}]")
+        if candidate_costs and cam_id in candidate_costs:
+            lines.append(
+                f"{cam_id}: {per_cam_scores[cam_id]:.3f} [{state}] cost={candidate_costs[cam_id]:.4f}"
+            )
+        else:
+            lines.append(f"{cam_id}: {per_cam_scores[cam_id]:.3f} [{state}]")
     y = 44
     for idx, line in enumerate(lines):
         scale = 0.8 if idx == 0 else 0.65
@@ -867,6 +1077,9 @@ def build_multiview_grid(
     inlier_cam_ids: List[str],
     per_cam_scores: Dict[str, float],
     min_pose_score: float,
+    selected_cam_ids: Optional[List[str]] = None,
+    candidate_costs: Optional[Dict[str, float]] = None,
+    fallback_cam_id: Optional[str] = None,
 ) -> np.ndarray:
     base_shape = raw_rgb.shape
     panels = [
@@ -875,7 +1088,19 @@ def build_multiview_grid(
         ("Coarse Pose", read_image(frame_paths["coarse"])),
         ("Refined Pose", read_image(frame_paths["refined"])),
         ("Fused Point Cloud", fused_scene),
-        ("Fusion Info", build_info_panel(fused_scene.shape, frame_id, inlier_cam_ids, per_cam_scores, min_pose_score)),
+        (
+            "Fusion Info",
+            build_info_panel(
+                fused_scene.shape,
+                frame_id,
+                inlier_cam_ids,
+                per_cam_scores,
+                min_pose_score,
+                selected_cam_ids=selected_cam_ids,
+                candidate_costs=candidate_costs,
+                fallback_cam_id=fallback_cam_id,
+            ),
+        ),
     ]
     titled = []
     for title, image in panels:
@@ -958,6 +1183,7 @@ def run_multiview_viewer(args):
     mesh = trimesh.load(mesh_path, force="mesh")
     mesh.apply_scale(1.0 / 1000.0)
     mesh_points_m, _ = trimesh.sample.sample_surface(mesh, 2500)
+    mesh_eval_points_m, _ = trimesh.sample.sample_surface(mesh, 900)
     overlay_dir = raw_data_dir / "gotrack_overlay"
     open3d_viewer = None
     if args.interactive_3d:
@@ -970,21 +1196,26 @@ def run_multiview_viewer(args):
     delay_ms = max(1, int(1000 / max(args.fps, 0.1)))
     paused = False
     index = 0
+    previous_accepted_pose_world: Optional[np.ndarray] = None
     cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
 
     while True:
         frame_id = frame_ids[index]
         per_cam_world_poses = {}
         per_cam_scores = {}
+        all_candidate_poses_world = {}
+        fallback_cam_id = None
         fused_points = []
         for cam_id in camera_ids:
             pose_path = result_dirs[cam_id] / f"per_frame_refined_poses_{frame_id:06d}.json"
             pose = parse_pose_file(pose_path)
             if pose is not None:
                 per_cam_scores[cam_id] = pose["score"]
+                pose_world = camera_pose_to_world_pose(pose, extrinsics[cam_id])
+                all_candidate_poses_world[cam_id] = (pose_world, pose["score"])
                 if pose["score"] >= args.min_pose_score:
                     per_cam_world_poses[cam_id] = (
-                        camera_pose_to_world_pose(pose, extrinsics[cam_id]),
+                        pose_world,
                         pose["score"],
                     )
             fused_points.append(
@@ -999,9 +1230,49 @@ def run_multiview_viewer(args):
                 )
             )
 
-        fused_pose_world, inlier_cam_ids = fuse_world_poses(
-            per_cam_world_poses, args.pose_inlier_thresh_m
-        )
+        if not per_cam_world_poses and all_candidate_poses_world:
+            fallback_cam_id = max(
+                all_candidate_poses_world.keys(),
+                key=lambda cam_id: all_candidate_poses_world[cam_id][1],
+            )
+            per_cam_world_poses = {
+                fallback_cam_id: all_candidate_poses_world[fallback_cam_id]
+            }
+
+        fused_pose_world = None
+        inlier_cam_ids = list(per_cam_world_poses.keys())
+        selected_cam_ids: List[str] = []
+        candidate_costs: Dict[str, float] = {}
+        if per_cam_world_poses:
+            fused_pose_world, selected_cam_ids, evaluations = select_and_refine_multiview_pose(
+                candidate_poses_world=per_cam_world_poses,
+                frame_id=frame_id,
+                camera_ids=camera_ids,
+                raw_data_dir=raw_data_dir,
+                camera_params=camera_params,
+                extrinsics=extrinsics,
+                mesh_points_m=mesh_eval_points_m,
+                max_depth_m=args.max_depth_m,
+            )
+            candidate_costs = {
+                cam_id: float(info["cost"]) for cam_id, info in evaluations.items()
+            }
+        if (
+            args.reject_large_jump
+            and fused_pose_world is not None
+            and previous_accepted_pose_world is not None
+        ):
+            prev_r, prev_t = split_transform(previous_accepted_pose_world)
+            curr_r, curr_t = split_transform(fused_pose_world)
+            translation_jump = float(np.linalg.norm(curr_t - prev_t))
+            rotation_jump = rotation_angle_deg(prev_r, curr_r)
+            if (
+                translation_jump > args.reject_translation_jump_m
+                or rotation_jump > args.reject_rotation_jump_deg
+            ):
+                fused_pose_world = previous_accepted_pose_world.copy()
+        if fused_pose_world is not None:
+            previous_accepted_pose_world = fused_pose_world.copy()
         points_world = np.concatenate(fused_points, axis=0) if fused_points else np.empty((0, 3), dtype=np.float32)
         object_points_world = np.empty((0, 3), dtype=np.float32)
         object_origin = None
@@ -1043,6 +1314,9 @@ def run_multiview_viewer(args):
             inlier_cam_ids=inlier_cam_ids,
             per_cam_scores=per_cam_scores,
             min_pose_score=args.min_pose_score,
+            selected_cam_ids=selected_cam_ids,
+            candidate_costs=candidate_costs,
+            fallback_cam_id=fallback_cam_id,
         )
         draw_status(grid, paused)
         cv2.imshow(args.window_name, grid)
