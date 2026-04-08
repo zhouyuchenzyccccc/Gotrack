@@ -713,6 +713,49 @@ def rotation_angle_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cos_theta)))
 
 
+def compute_pose_jump(
+    previous_pose_world: np.ndarray, current_pose_world: np.ndarray
+) -> Tuple[float, float]:
+    prev_r, prev_t = split_transform(previous_pose_world)
+    curr_r, curr_t = split_transform(current_pose_world)
+    translation_jump = float(np.linalg.norm(curr_t - prev_t))
+    rotation_jump = rotation_angle_deg(prev_r, curr_r)
+    return translation_jump, rotation_jump
+
+
+def filter_large_pose_jump(
+    frame_id: int,
+    current_pose_world: Optional[np.ndarray],
+    previous_pose_world: Optional[np.ndarray],
+    enabled: bool,
+    translation_thresh_m: float,
+    rotation_thresh_deg: float,
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    if current_pose_world is None or previous_pose_world is None or not enabled:
+        return current_pose_world, None
+
+    translation_jump, rotation_jump = compute_pose_jump(
+        previous_pose_world, current_pose_world
+    )
+    if (
+        translation_jump <= translation_thresh_m
+        and rotation_jump <= rotation_thresh_deg
+    ):
+        return current_pose_world, None
+
+    print(
+        "[pose-filter] frame "
+        f"{frame_id:06d} rejected, "
+        f"translation_jump={translation_jump:.4f} m, "
+        f"rotation_jump={rotation_jump:.2f} deg. "
+        "Using previous accepted pose."
+    )
+    return (
+        previous_pose_world.copy(),
+        f"replaced by prev | dt={translation_jump:.3f}m | dr={rotation_jump:.1f}deg",
+    )
+
+
 def fuse_world_poses(
     poses_world: Dict[str, Tuple[np.ndarray, float]],
     inlier_thresh_m: float,
@@ -1042,6 +1085,7 @@ def build_info_panel(
     selected_cam_ids: Optional[List[str]] = None,
     candidate_costs: Optional[Dict[str, float]] = None,
     fallback_cam_id: Optional[str] = None,
+    filter_status: Optional[str] = None,
 ) -> np.ndarray:
     panel = np.full(shape, 248, dtype=np.uint8)
     lines = [
@@ -1049,6 +1093,8 @@ def build_info_panel(
         f"fused views: {', '.join(inlier_cam_ids) if inlier_cam_ids else 'none'}",
         f"min score: {min_pose_score:.2f}",
     ]
+    if filter_status:
+        lines.append(f"filter: {filter_status}")
     if selected_cam_ids:
         lines.append(f"selected: {', '.join(selected_cam_ids)}")
     if fallback_cam_id:
@@ -1080,6 +1126,7 @@ def build_multiview_grid(
     selected_cam_ids: Optional[List[str]] = None,
     candidate_costs: Optional[Dict[str, float]] = None,
     fallback_cam_id: Optional[str] = None,
+    filter_status: Optional[str] = None,
 ) -> np.ndarray:
     base_shape = raw_rgb.shape
     panels = [
@@ -1099,6 +1146,7 @@ def build_multiview_grid(
                 selected_cam_ids=selected_cam_ids,
                 candidate_costs=candidate_costs,
                 fallback_cam_id=fallback_cam_id,
+                filter_status=filter_status,
             ),
         ),
     ]
@@ -1243,6 +1291,7 @@ def run_multiview_viewer(args):
         inlier_cam_ids = list(per_cam_world_poses.keys())
         selected_cam_ids: List[str] = []
         candidate_costs: Dict[str, float] = {}
+        filter_status: Optional[str] = None
         if per_cam_world_poses:
             fused_pose_world, selected_cam_ids, evaluations = select_and_refine_multiview_pose(
                 candidate_poses_world=per_cam_world_poses,
@@ -1257,20 +1306,14 @@ def run_multiview_viewer(args):
             candidate_costs = {
                 cam_id: float(info["cost"]) for cam_id, info in evaluations.items()
             }
-        if (
-            args.reject_large_jump
-            and fused_pose_world is not None
-            and previous_accepted_pose_world is not None
-        ):
-            prev_r, prev_t = split_transform(previous_accepted_pose_world)
-            curr_r, curr_t = split_transform(fused_pose_world)
-            translation_jump = float(np.linalg.norm(curr_t - prev_t))
-            rotation_jump = rotation_angle_deg(prev_r, curr_r)
-            if (
-                translation_jump > args.reject_translation_jump_m
-                or rotation_jump > args.reject_rotation_jump_deg
-            ):
-                fused_pose_world = previous_accepted_pose_world.copy()
+        fused_pose_world, filter_status = filter_large_pose_jump(
+            frame_id=frame_id,
+            current_pose_world=fused_pose_world,
+            previous_pose_world=previous_accepted_pose_world,
+            enabled=args.reject_large_jump,
+            translation_thresh_m=args.reject_translation_jump_m,
+            rotation_thresh_deg=args.reject_rotation_jump_deg,
+        )
         if fused_pose_world is not None:
             previous_accepted_pose_world = fused_pose_world.copy()
         points_world = np.concatenate(fused_points, axis=0) if fused_points else np.empty((0, 3), dtype=np.float32)
@@ -1292,7 +1335,11 @@ def run_multiview_viewer(args):
             points_world=points_world,
             fused_pose_world=fused_pose_world,
             mesh_points_m=mesh_points_m,
-            title=f"Fused 3D pose | views: {len(inlier_cam_ids)}",
+            title=(
+                f"Fused 3D pose | views: {len(inlier_cam_ids)}"
+                if filter_status is None
+                else f"Fused 3D pose | views: {len(inlier_cam_ids)} | filtered"
+            ),
         )
         if open3d_viewer is not None:
             open3d_viewer.update(
@@ -1317,6 +1364,7 @@ def run_multiview_viewer(args):
             selected_cam_ids=selected_cam_ids,
             candidate_costs=candidate_costs,
             fallback_cam_id=fallback_cam_id,
+            filter_status=filter_status,
         )
         draw_status(grid, paused)
         cv2.imshow(args.window_name, grid)
