@@ -1,0 +1,48 @@
+# datasets / raw data
+bop_datasets/
+outputs/
+results/
+
+# checkpoints / weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.trt
+
+# caches / envs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env/
+.cache/
+.pytest_cache/
+
+# logs
+logs/
+runs/
+wandb/
+tensorboard/
+
+# build artifacts
+build/
+dist/
+*.o
+*.so
+*.dll
+*.exe
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# generated media
+*.mp4
+*.avi
+*.mov
+*.npz
