@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
+"""
 
+
+
+deactivate 2>/dev/null || true
+conda deactivate 2>/dev/null || true
+source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+conda activate gotrack
+
+ python scripts/view_pose_pipeline.py   --bop-root /home/ubuntu/WorkSpace/ZYC/gotrack-main/bop_datasets   --dataset-name electric_drill   --raw-data-dir /home/ubuntu/orbbec/src/sync/test/test/drill   --mesh-path /home/ubuntu/WorkSpace/ZYC/FoundationPose/demo_data/electric_drill/mesh/Scan.ply   --camera-ids 00,01,02,03,04,05   --reference-camera 00   --fps 5   --skip-inference --reject-translation-jump-m 0.5 --reject-rotation-jump-deg 100
+
+
+"""
 import argparse
 import csv
 import json
