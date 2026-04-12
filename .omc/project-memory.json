@@ -1,0 +1,125 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775631108216,
+  "projectRoot": "f:\\论文下载\\科研工程\\gotrack-main\\Gotrack",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775631108151,
+      "keyFiles": [
+        "inference_gotrack.yaml",
+        "inference_pose_estimation.yaml"
+      ]
+    },
+    "dataloader": {
+      "path": "dataloader",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775631108152,
+      "keyFiles": [
+        "base.py",
+        "bop.py"
+      ]
+    },
+    "external": {
+      "path": "external",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775631108152,
+      "keyFiles": []
+    },
+    "media": {
+      "path": "media",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775631108153,
+      "keyFiles": [
+        "gotrack.png",
+        "qualitative_pose_pipeline.png"
+      ]
+    },
+    "model": {
+      "path": "model",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1775631108154,
+      "keyFiles": [
+        "base.py",
+        "cnos.py",
+        "config.py",
+        "foundpose.py",
+        "gotrack.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 11,
+      "lastAccessed": 1775631108155,
+      "keyFiles": [
+        "download_bop_classic_core.py",
+        "download_bop_h3.py",
+        "download_coarse_poses_bop_classic_core.py",
+        "download_default_detections_bop_classic_core.py",
+        "download_default_detections_bop_h3.py"
+      ]
+    },
+    "utils": {
+      "path": "utils",
+      "purpose": "Utility functions",
+      "fileCount": 32,
+      "lastAccessed": 1775631108155,
+      "keyFiles": [
+        "cluster_util.py",
+        "config.py",
+        "corresp_util.py",
+        "crop_generation.py",
+        "data_util.py"
+      ]
+    },
+    "configs\\data": {
+      "path": "configs\\data",
+      "purpose": "Data files",
+      "fileCount": 1,
+      "lastAccessed": 1775631108156,
+      "keyFiles": [
+        "bop.yaml"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
