@@ -1,1 +1,2 @@
-"""view_pose_pipeline — modular GoTrack multi-view pose viewer."""
+"""Modular multi-view GoTrack pose pipeline."""
+
